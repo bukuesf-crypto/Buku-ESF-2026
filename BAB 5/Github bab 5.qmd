@@ -1,0 +1,1989 @@
+---
+title: "Aplikasi RE-ESF pada Data Indeks Ketahanan Pangan Indonesia"
+author: "Fatkhurokhman Fauzi"
+format: html
+editor: visual
+---
+
+## Aplikasi RE-ESF pada Data Indeks Ketahanan Pangan Indonesia
+
+Analisis ini menerapkan Random Effect Eigenvector Spatial Filtering (RE-ESF) untuk memodelkan Indeks Ketahanan Pangan (Food Security Index/FSI) kabupaten/kota di Indonesia tahun 2022. Pendekatan RE-ESF digunakan untuk mengakomodasi ketergantungan spasial antarwilayah yang belum dapat dijelaskan sepenuhnya oleh model regresi linear.
+
+Tujuan analisis adalah mengidentifikasi faktor-faktor yang memengaruhi FSI dengan mempertimbangkan struktur spasial pada data, serta mengevaluasi apakah penggunaan komponen spasial berbasis Moran eigenvector dapat meningkatkan kinerja model dan mengurangi autokorelasi spasial pada sisaan. Hasil RE-ESF selanjutnya dibandingkan dengan regresi linear berdasarkan ukuran kecocokan model dan diagnostik sisaan spasial.
+
+## Persiapan Lingkungan Analisis
+
+Tahap awal analisis dilakukan dengan menyiapkan lingkungan kerja di **RStudio** serta memanggil package R yang diperlukan. Package utama yang digunakan adalah `spmoran` untuk membentuk Moran eigenvector dan menduga model RE-ESF, sedangkan package lain seperti `sf`, `spdep`, `dplyr`, `ggplot2`, `car`, dan `corrplot` digunakan untuk pengolahan data spasial, eksplorasi data, pemeriksaan multikolinearitas, visualisasi, dan diagnostik model. Persiapan ini memastikan seluruh tahapan analisis dapat dijalankan secara sistematis dan direplikasi.
+
+```{r}
+library(spmoran)
+library(sf)
+library(spdep)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(corrplot)
+library(scales)
+library(tidyr)
+```
+
+## Membaca dan Menyiapkan Data
+
+Tahap ini dilakukan dengan membaca data Indeks Ketahanan Pangan Indonesia tahun 2022 ke dalam R, kemudian memeriksa struktur data, tipe peubah, dan keberadaan nilai yang hilang. Data terdiri atas 514 kabupaten/kota di Indonesia dengan Indeks Ketahanan Pangan sebagai peubah respons, sejumlah indikator sosial-ekonomi, demografi, dan pertanian sebagai peubah penjelas, serta koordinat geografis setiap kabupaten/kota yang digunakan dalam pembentukan struktur spasial.
+
+Peubah yang tersedia dalam data meliputi:
+
+-   **Nama Wilayah**: nama kabupaten/kota.
+
+-   **Tahun**: tahun pengamatan, yaitu 2022.
+
+-   **ADM2_PCODE**: kode administratif kabupaten/kota.
+
+-   **IKP (FSI)**: Indeks Ketahanan Pangan (*Food Security Index*) sebagai peubah respons.
+
+-   **IPM (HDI)**: Indeks Pembangunan Manusia (*Human Development Index*).
+
+-   **AHD (LE)**: angka harapan hidup (*Life Expectancy*).
+
+-   **R_SKL (ASP)**: rata-rata lama sekolah (*Average Years of Schooling*).
+
+-   **PDRB (GRDP)**: Produk Domestik Regional Bruto (*Gross Regional Domestic Product*).
+
+-   **Pend (PGR)**: laju pertumbuhan penduduk (*Population Growth Rate*).
+
+-   **PTP (FCP)**: produksi tanaman pangan (*Food Crop Production*).
+
+-   **Miskin (PP)**: persentase penduduk miskin (*Percentage of Poor Population*).
+
+-   **PengK (CE)**: pengeluaran per kapita (*Consumption Expenditure/Expenditure per Capita*).
+
+-   **x**: koordinat bujur (*longitude*) wilayah.
+
+-   **y**: koordinat lintang (*latitude*) wilayah.
+
+Pada tahap selanjutnya, IKP digunakan sebagai peubah respons, sedangkan IPM, AHD, R_SKL, PDRB, Pend, PTP, Miskin, dan PengK dipersiapkan sebagai kandidat peubah penjelas. Koordinat `x` dan `y` tidak digunakan sebagai peubah penjelas dalam persamaan regresi, tetapi digunakan untuk membentuk basis spasial dan Moran eigenvector pada pemodelan RE-ESF.
+
+```{r}
+# ============================================================
+# MEMBACA DAN MENYIAPKAN DATA
+# Aplikasi RE-ESF pada Data Indeks Ketahanan Pangan Indonesia
+# ============================================================
+
+# Package
+library(readxl)
+library(dplyr)
+
+# ------------------------------------------------------------
+# Membaca data
+# ------------------------------------------------------------
+
+data_ikp <- read_excel(
+  "~/Documents/IKP_2022_REESF.xlsx",
+  sheet = "IKP_2022"
+)
+
+# Menampilkan enam baris pertama
+head(data_ikp)
+
+# Memeriksa dimensi data
+dim(data_ikp)
+
+# Memeriksa struktur data
+str(data_ikp)
+
+# Memeriksa nama peubah
+names(data_ikp)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Pemeriksaan kelengkapan data
+# ------------------------------------------------------------
+
+# Jumlah missing value pada setiap peubah
+colSums(is.na(data_ikp))
+
+# Jumlah total missing value
+sum(is.na(data_ikp))
+
+# Memeriksa tahun pengamatan
+table(data_ikp$Tahun)
+
+# Memeriksa jumlah wilayah
+n_distinct(data_ikp$Wilayah)
+
+# Memeriksa jumlah kode kabupaten/kota
+n_distinct(data_ikp$ADM2_PCODE)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Memeriksa tipe data
+# ------------------------------------------------------------
+
+str(data_ikp)
+
+# Daftar peubah numerik yang akan digunakan
+variabel_numerik <- c(
+  "FSI", "HDI", "LE", "ASP",
+  "GRDP", "PGR", "FCP", "PP", "CE",
+  "lon", "lat"
+)
+
+# Memastikan seluruh peubah analisis bertipe numerik
+data_ikp <- data_ikp %>%
+  mutate(
+    Tahun = as.integer(Tahun),
+    across(
+      all_of(variabel_numerik),
+      as.numeric
+    )
+  )
+
+str(data_ikp)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Menyiapkan peubah analisis
+# ------------------------------------------------------------
+
+# Peubah respons
+y <- data_ikp$FSI
+
+# Kandidat peubah penjelas
+x <- data_ikp %>%
+  select(
+    HDI, LE, ASP, GRDP,
+    PGR, FCP, PP, CE
+  )
+
+# Koordinat geografis
+coords <- data_ikp %>%
+  select(lon, lat)
+
+# Pemeriksaan
+head(y)
+head(x)
+head(coords)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Ringkasan data
+# ------------------------------------------------------------
+
+summary(data_ikp)
+
+# Ringkasan khusus peubah analisis
+summary(
+  data_ikp %>%
+    select(FSI, HDI, LE, ASP, GRDP, PGR, FCP, PP, CE)
+)
+```
+
+## Eksplorasi Data
+
+Tahap eksplorasi data dilakukan untuk memperoleh gambaran awal mengenai karakteristik Indeks Ketahanan Pangan (FSI) dan peubah-peubah penjelas pada 514 kabupaten/kota di Indonesia. Analisis mencakup ringkasan statistik deskriptif, pemeriksaan distribusi FSI, visualisasi pola spasial melalui peta tematik, serta analisis korelasi antarpeubah. Tahap ini bertujuan untuk mengidentifikasi pola umum, variasi antarwilayah, dan hubungan awal antarpeubah sebelum dilakukan pemodelan regresi linear dan RE-ESF.
+
+```{r}
+# ============================================================
+# DISTRIBUSI FOOD SECURITY INDEX
+# ============================================================
+
+g_fsi <- ggplot(data_ikp, aes(x = FSI)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 25,
+    fill = "lightblue",
+    color = "grey40",
+    linewidth = 0.4
+  ) +
+  geom_density(
+    linewidth = 1
+  ) +
+  labs(
+    title = "Food Security Index",
+    x = "Value",
+    y = "Density"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    )
+  )
+
+g_fsi
+```
+
+```{r}
+# ============================================================
+# MATRIKS KORELASI
+# ============================================================
+
+data_korelasi <- data_ikp %>%
+  select(
+    FSI,
+    HDI,
+    LE,
+    ASP,
+    GRDP,
+    PGR,
+    FCP,
+    PP,
+    CE
+  )
+
+# Matriks korelasi Pearson
+cor_matrix <- cor(
+  data_korelasi,
+  use = "complete.obs",
+  method = "pearson"
+)
+
+# Membulatkan hasil
+round(cor_matrix, 2)
+```
+
+```{r}
+
+# ============================================================
+# VISUALISASI
+# ============================================================
+library(ggcorrplot)
+
+warna_korelasi <- colorRampPalette(
+  c(
+    "#67001F",  # merah tua (-1)
+    "#D73027",
+    "#F46D43",
+    "#FFFFFF",  # 0
+    "#74ADD1",
+    "#4575B4",
+    "#053061"   # biru tua (+1)
+  )
+)(200)
+
+# Menggunakan koma sebagai tanda desimal
+old_option <- getOption("OutDec")
+options(OutDec = ",")
+
+corrplot(
+  cor_matrix,
+
+  # Bentuk matriks
+  method = "number",
+  type = "upper",
+  order = "original",
+  diag = TRUE,
+
+  # Warna angka berdasarkan nilai korelasi
+  col = warna_korelasi,
+
+  # Rentang korelasi
+  col.lim = c(-1, 1),
+
+  # Label peubah
+  tl.col = "red",
+  tl.cex = 1.25,
+  tl.srt = 90,
+
+  # Ukuran angka korelasi
+  number.cex = 1.05,
+  number.digits = 2,
+
+  # Garis setiap sel
+  addgrid.col = "#D0D0D0",
+
+  # Color legend
+  cl.pos = "r",
+  cl.cex = 0.9,
+  cl.ratio = 0.15,
+  cl.length = 11,
+
+  # Background
+  bg = "white",
+
+  # Margin
+  mar = c(0, 0, 0, 0)
+)
+
+# Mengembalikan pengaturan desimal
+options(OutDec = old_option)
+```
+
+## Standardisasi Peubah
+
+Standardisasi dilakukan untuk menyetarakan skala peubah penjelas karena setiap peubah memiliki satuan pengukuran yang berbeda, seperti tahun, persen, nilai ekonomi, dan jumlah produksi. Sesuai dengan Bab 5, standardisasi dilakukan menggunakan **min-max scaling**, sehingga setiap peubah penjelas ditransformasikan ke rentang 0–1. Pada tahap ini, **FSI sebagai peubah respons serta koordinat `lon` dan `lat` tidak distandardisasi**. Seluruh kandidat peubah penjelas, termasuk HDI, tetap dipertahankan karena pemeriksaan dan penghapusan peubah akibat multikolinearitas dilakukan pada tahap berikutnya menggunakan VIF.
+
+```{r}
+# ============================================================
+# Metode Min-Max Scaling
+# ============================================================
+
+library(dplyr)
+
+# ------------------------------------------------------------
+# Fungsi Min-Max Scaling
+# ------------------------------------------------------------
+
+min_max <- function(x) {
+  (x - min(x, na.rm = TRUE)) /
+    (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+
+# ------------------------------------------------------------
+# Standardisasi peubah penjelas
+# ------------------------------------------------------------
+
+data_ikp_scaled <- data_ikp %>%
+  mutate(
+    across(
+      c(
+        HDI,
+        LE,
+        ASP,
+        GRDP,
+        PGR,
+        FCP,
+        PP,
+        CE
+      ),
+      min_max
+    )
+  )
+
+
+# ------------------------------------------------------------
+# Memeriksa hasil standardisasi
+# ------------------------------------------------------------
+
+summary(
+  data_ikp_scaled %>%
+    select(
+      HDI,
+      LE,
+      ASP,
+      GRDP,
+      PGR,
+      FCP,
+      PP,
+      CE
+    )
+)
+
+# ------------------------------------------------------------
+# Memeriksa nilai minimum dan maksimum
+# ------------------------------------------------------------
+
+data_ikp_scaled %>%
+  summarise(
+    across(
+      c(
+        HDI,
+        LE,
+        ASP,
+        GRDP,
+        PGR,
+        FCP,
+        PP,
+        CE
+      ),
+      list(
+        Min = ~ min(.x, na.rm = TRUE),
+        Max = ~ max(.x, na.rm = TRUE)
+      )
+    )
+  )
+```
+
+## Pemeriksaan Multikolinearitas
+
+Pemeriksaan multikolinearitas dilakukan untuk mengetahui apakah terdapat hubungan linear yang kuat antarpeubah penjelas yang dapat menyebabkan pendugaan koefisien regresi menjadi tidak stabil. Pemeriksaan dilakukan menggunakan *Variance Inflation Factor (VIF)*. Sesuai Bab 5, model awal mencakup seluruh kandidat peubah penjelas. Hasil pemeriksaan menunjukkan bahwa HDI memiliki VIF sebesar 33,87, sehingga dikeluarkan dari model. Setelah HDI dihapus, seluruh peubah penjelas lainnya memiliki nilai VIF di bawah 10 dan selanjutnya digunakan dalam pemodelan regresi linear dan RE-ESF.
+
+```{r}
+# ============================================================
+# PEMERIKSAAN MULTIKOLINEARITAS
+# Menggunakan Variance Inflation Factor (VIF)
+# ============================================================
+
+library(car)
+library(dplyr)
+
+# ------------------------------------------------------------
+# Model awal dengan seluruh peubah penjelas
+# ------------------------------------------------------------
+
+model_vif_awal <- lm(
+  FSI ~ HDI + LE + ASP + GRDP + PGR + FCP + PP + CE,
+  data = data_ikp_scaled
+)
+
+
+# ------------------------------------------------------------
+# Menghitung VIF model awal
+# ------------------------------------------------------------
+
+vif_awal <- car::vif(model_vif_awal)
+
+vif_awal
+
+
+# Membuat tabel VIF
+tabel_vif_awal <- data.frame(
+  Peubah = names(vif_awal),
+  VIF = as.numeric(vif_awal)
+)
+
+tabel_vif_awal$VIF <- round(
+  tabel_vif_awal$VIF,
+  2
+)
+
+tabel_vif_awal
+```
+
+## Model Regresi Linear sebagai Baseline
+
+Model regresi linear digunakan sebagai model dasar (baseline) untuk menggambarkan hubungan global antara Food Security Index (FSI) dan peubah-peubah penjelas sebelum struktur spasial dimasukkan ke dalam model. Berdasarkan hasil pemeriksaan multikolinearitas, peubah HDI tidak lagi digunakan, sehingga model dibentuk menggunakan LE, ASP, GRDP, PGR, FCP, PP, dan CE. Hasil model regresi linear selanjutnya digunakan sebagai pembanding terhadap RE-ESF, baik dari sisi koefisien regresi, adjusted R2, RMSE, AIC, maupun diagnostik sisaan spasial.
+
+```{r}
+# ============================================================
+# MODEL REGRESI LINEAR SEBAGAI BASELINE
+# ============================================================
+
+library(dplyr)
+
+# ------------------------------------------------------------
+# Membentuk model regresi linear
+# ------------------------------------------------------------
+
+model_lm <- lm(
+  FSI ~ LE + ASP + GRDP + PGR + FCP + PP + CE,
+  data = data_ikp_scaled
+)
+
+# Menampilkan ringkasan model
+summary(model_lm)
+
+# ------------------------------------------------------------
+# Koefisien regresi
+# ------------------------------------------------------------
+
+coef_lm <- summary(model_lm)$coefficients
+
+coef_lm
+
+# Membuat tabel koefisien
+tabel_koef_lm <- data.frame(
+  Peubah = rownames(coef_lm),
+  Koefisien = coef_lm[, "Estimate"],
+  Galat_Baku = coef_lm[, "Std. Error"],
+  Statistik_t = coef_lm[, "t value"],
+  Nilai_p = coef_lm[, "Pr(>|t|)"],
+  row.names = NULL
+)
+
+# Membulatkan hasil
+tabel_koef_lm <- tabel_koef_lm %>%
+  mutate(
+    across(
+      c(Koefisien, Galat_Baku, Statistik_t),
+      ~ round(.x, 2)
+    ),
+    Nilai_p = round(Nilai_p, 4)
+  )
+
+tabel_koef_lm
+
+# ------------------------------------------------------------
+# Nilai prediksi dan residual
+# ------------------------------------------------------------
+
+data_ikp_scaled <- data_ikp_scaled %>%
+  mutate(
+    Prediksi_LM = predict(model_lm),
+    Residual_LM = residuals(model_lm)
+  )
+
+# Pemeriksaan
+head(
+  data_ikp_scaled %>%
+    select(
+      Wilayah,
+      FSI,
+      Prediksi_LM,
+      Residual_LM
+    )
+)
+
+# ------------------------------------------------------------
+# Adjusted R-squared
+# ------------------------------------------------------------
+
+adj_r2_lm <- summary(model_lm)$adj.r.squared
+
+adj_r2_lm
+
+# ------------------------------------------------------------
+# AIC
+# ------------------------------------------------------------
+
+aic_lm <- AIC(model_lm)
+
+aic_lm
+
+# ------------------------------------------------------------
+# RMSE
+# ------------------------------------------------------------
+
+rmse_lm <- sqrt(
+  mean(
+    residuals(model_lm)^2,
+    na.rm = TRUE
+  )
+)
+
+rmse_lm
+
+# ------------------------------------------------------------
+# Ringkasan kinerja model baseline
+# ------------------------------------------------------------
+
+evaluasi_lm <- data.frame(
+  Model = "Regresi Linear",
+  Adjusted_R2 = round(adj_r2_lm, 3),
+  RMSE = round(rmse_lm, 2),
+  AIC = round(aic_lm, 2)
+)
+
+evaluasi_lm
+```
+
+## Diagnostik Model Regresi Linear
+
+Diagnostik model regresi linear dilakukan untuk mengevaluasi apakah sisaan model masih mengandung pola yang belum terakomodasi. Pemeriksaan difokuskan pada autokorelasi spasial menggunakan Moran's I dan heteroskedastisitas menggunakan uji Breusch–Pagan. Pada Bab 5, sisaan regresi linear menunjukkan Moran's I sebesar 0,28 dengan nilai-p 0,00 serta statistik Breusch–Pagan sebesar 50,03 dengan nilai-p 0,00. Hasil tersebut menunjukkan bahwa model regresi linear belum sepenuhnya memadai, sehingga diperlukan model yang dapat mengakomodasi struktur spasial, yaitu RE-ESF.
+
+```{r}
+# ============================================================
+# DIAGNOSTIK MODEL REGRESI LINEAR
+# Moran's I dan Breusch-Pagan Test
+# ============================================================
+
+
+library(spdep)
+library(lmtest)
+library(dplyr)
+
+
+# ------------------------------------------------------------
+# Menyiapkan residual model regresi linear
+# ------------------------------------------------------------
+
+residual_lm <- residuals(model_lm)
+
+# Pemeriksaan
+head(residual_lm)
+
+summary(residual_lm)
+
+# ------------------------------------------------------------
+# Menyiapkan koordinat lokasi
+# ------------------------------------------------------------
+
+coords <- as.matrix(
+  data_ikp_scaled[, c("lon", "lat")]
+)
+
+head(coords)
+
+# ------------------------------------------------------------
+# Membentuk struktur ketetanggaan 3-NN
+# ------------------------------------------------------------
+
+knn_3 <- knearneigh(
+  coords,
+  k = 3,
+  longlat = TRUE
+)
+
+nb_3 <- knn2nb(knn_3)
+
+summary(nb_3)
+
+# ------------------------------------------------------------
+# Membentuk spatial weights
+# Row-standardized weights
+# ------------------------------------------------------------
+
+listw_3 <- nb2listw(
+  nb_3,
+  style = "W",
+  zero.policy = TRUE
+)
+
+listw_3
+
+
+# ------------------------------------------------------------
+# Moran's I residual regresi linear
+# ------------------------------------------------------------
+
+moran_lm <- moran.test(
+  residual_lm,
+  listw_3,
+  zero.policy = TRUE
+)
+
+moran_lm
+
+# ------------------------------------------------------------
+# Mengambil Moran's I dan p-value
+# ------------------------------------------------------------
+
+moran_I_lm <- as.numeric(
+  moran_lm$estimate[["Moran I statistic"]]
+)
+
+moran_p_lm <- moran_lm$p.value
+
+cat(
+  "Moran's I =",
+  round(moran_I_lm, 3),
+  "\n"
+)
+
+cat(
+  "p-value =",
+  moran_p_lm,
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# Breusch-Pagan Test
+# ------------------------------------------------------------
+
+bp_lm <- bptest(model_lm)
+
+bp_lm
+
+# ------------------------------------------------------------
+# Mengambil statistik BP dan p-value
+# ------------------------------------------------------------
+
+bp_stat_lm <- as.numeric(
+  bp_lm$statistic
+)
+
+bp_p_lm <- bp_lm$p.value
+
+cat(
+  "Breusch-Pagan =",
+  round(bp_stat_lm, 3),
+  "\n"
+)
+
+cat(
+  "p-value =",
+  bp_p_lm,
+  "\n"
+)
+
+# ------------------------------------------------------------
+# Membuat tabel diagnostik residual
+# ------------------------------------------------------------
+
+tabel_diagnostik_lm <- data.frame(
+
+  Asumsi = c(
+    "Autokorelasi spasial",
+    "Heteroskedastisitas"
+  ),
+
+  Uji = c(
+    "Moran's I",
+    "Breusch-Pagan"
+  ),
+
+  Statistik = c(
+    moran_I_lm,
+    bp_stat_lm
+  ),
+
+  Nilai_p = c(
+    moran_p_lm,
+    bp_p_lm
+  )
+)
+
+tabel_diagnostik_lm <- tabel_diagnostik_lm %>%
+  mutate(
+    Statistik = round(Statistik, 3),
+    Nilai_p = round(Nilai_p, 4)
+  )
+
+tabel_diagnostik_lm
+```
+
+## Persiapan Koordinat Spasial
+
+Koordinat geografis setiap kabupaten/kota digunakan untuk merepresentasikan posisi antarwilayah dalam analisis spasial. Pada data IKP 2022, informasi lokasi tersedia melalui peubah **`lon`** dan **`lat`**. Pada analisis sumber, posisi setiap wilayah diperoleh dari koordinat centroid poligon kabupaten/kota, kemudian koordinat tersebut digunakan secara langsung dalam perhitungan jarak antarwilayah tanpa terlebih dahulu diproyeksikan ke sistem koordinat metrik.
+
+Karena shapefile kabupaten/kota yang digunakan pada analisis asli tidak tersedia pada implementasi ini, koordinat **`lon`** dan **`lat`** yang terdapat pada data IKP digunakan sebagai representasi lokasi setiap wilayah. Kedua koordinat tersebut disusun dalam bentuk matriks koordinat, kemudian matriks jarak antarwilayah dihitung menggunakan fungsi `dist()`. Matriks jarak ini selanjutnya menjadi dasar pembentukan berbagai matriks pembobot spasial yang digunakan dalam ekstraksi Moran eigenvector dan pemodelan RE-ESF. Pendekatan ini dipilih agar proses komputasi tetap mengikuti struktur analisis sumber sedekat mungkin.
+
+```{r}
+# ============================================================
+# PERSIAPAN KOORDINAT SPASIAL
+# ============================================================
+
+library(dplyr)
+
+
+# ------------------------------------------------------------
+# Memeriksa koordinat
+# ------------------------------------------------------------
+
+data_ikp_scaled %>%
+  summarise(
+    Missing_lon = sum(is.na(lon)),
+    Missing_lat = sum(is.na(lat))
+  )
+
+# Rentang longitude
+range(
+  data_ikp_scaled$lon,
+  na.rm = TRUE
+)
+
+# Rentang latitude
+range(
+  data_ikp_scaled$lat,
+  na.rm = TRUE
+)
+
+# ------------------------------------------------------------
+# Memastikan koordinat bertipe numerik
+# ------------------------------------------------------------
+
+data_ikp_scaled <- data_ikp_scaled %>%
+  mutate(
+    lon = as.numeric(lon),
+    lat = as.numeric(lat)
+  )
+
+
+# ------------------------------------------------------------
+# Membentuk matriks koordinat
+# ------------------------------------------------------------
+
+longlat <- as.matrix(
+  data_ikp_scaled[
+    ,
+    c(
+      "lon",
+      "lat"
+    )
+  ]
+)
+
+# Memberikan nama kolom
+colnames(longlat) <- c(
+  "lon",
+  "lat"
+)
+
+
+# ------------------------------------------------------------
+# Memeriksa hasil
+# ------------------------------------------------------------
+
+head(longlat)
+
+dim(longlat)
+
+cat(
+  "Jumlah observasi =",
+  nrow(data_ikp_scaled),
+  "\n"
+)
+
+cat(
+  "Jumlah koordinat =",
+  nrow(longlat),
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# Memeriksa koordinat duplikat
+# ------------------------------------------------------------
+
+jumlah_duplikat <- sum(
+  duplicated(longlat)
+)
+
+cat(
+  "Jumlah koordinat duplikat =",
+  jumlah_duplikat,
+  "\n"
+)
+
+if (jumlah_duplikat > 0) {
+
+  indeks_duplikat <-
+    duplicated(longlat) |
+    duplicated(longlat, fromLast = TRUE)
+
+  print(
+    data_ikp_scaled[
+      indeks_duplikat,
+      c(
+        "Wilayah",
+        "ADM2_PCODE",
+        "lon",
+        "lat"
+      )
+    ]
+  )
+}
+
+
+# ------------------------------------------------------------
+# Membentuk matriks jarak
+# ------------------------------------------------------------
+
+Sp <- as.matrix(
+  longlat
+)
+
+DD <- as.matrix(
+  dist(Sp)
+)
+
+# ------------------------------------------------------------
+# Pemeriksaan matriks jarak
+# ------------------------------------------------------------
+
+dim(DD)
+
+round(
+  DD[1:6, 1:6],
+  4
+)
+
+summary(
+  DD[
+    upper.tri(DD)
+  ]
+)
+
+
+# ------------------------------------------------------------
+# Threshold yang digunakan pada analisis sumber
+# ------------------------------------------------------------
+
+th <- 2.7
+
+cat(
+  "Threshold yang digunakan =",
+  th,
+  "satuan koordinat\n"
+)
+
+# ------------------------------------------------------------
+# Objek utama untuk tahap berikutnya
+# ------------------------------------------------------------
+
+
+head(longlat)
+```
+
+## Pembentukan dan Perbandingan Matriks Pembobot Spasial
+
+Matriks pembobot spasial digunakan untuk merepresentasikan tingkat kedekatan atau hubungan antar kabupaten/kota. Sesuai dengan analisis pada Bab 5, dibandingkan lima bentuk pembobot, yaitu **j**arak ambang, jarak eksponensial, 3-tetangga terdekat, jarak invers, dan double power distance. Masing-masing matriks digunakan untuk membentuk Moran eigenvector dan selanjutnya dimasukkan ke dalam model RE-ESF. Pemilihan matriks terbaik dilakukan berdasarkan adjustedR2, RMSE, dan AIC.
+
+```{r}
+# ============================================================
+# 9. PEMBENTUKAN MATRIKS PEMBOBOT SPASIAL
+# ============================================================
+
+library(FastKNN)
+library(spdep)
+
+
+# ------------------------------------------------------------
+# Pemeriksaan objek koordinat dan matriks jarak
+# ------------------------------------------------------------
+
+dim(longlat)
+dim(DD)
+
+# Jumlah lokasi
+n <- nrow(DD)
+
+cat(
+  "Jumlah lokasi =",
+  n,
+  "\n"
+)
+
+th <- 2.7
+
+cat(
+  "Threshold =",
+  th,
+  "\n"
+)
+
+# ============================================================
+# MATRIKS 1
+# JARAK AMBANG / THRESHOLD DISTANCE
+# ============================================================
+
+W_threshold <- matrix(
+  0,
+  nrow = n,
+  ncol = n
+)
+
+for (i in seq_len(n)) {
+
+  W_threshold[i, ] <- ifelse(
+    DD[i, ] < th,
+    1,
+    0
+  )
+}
+
+diag(W_threshold) <- 0
+
+# ============================================================
+# MATRIKS 2
+# JARAK EKSPONENSIAL
+# ============================================================
+
+alpha_exp <- 1
+
+W_exponential <- matrix(
+  0,
+  nrow = n,
+  ncol = n
+)
+
+for (i in seq_len(n)) {
+
+  W_exponential[i, ] <- exp(
+    -alpha_exp * DD[i, ]
+  )
+}
+
+diag(W_exponential) <- 0
+
+
+# ============================================================
+# MATRIKS 3
+# 3-NEAREST NEIGHBOR
+# ============================================================
+
+k_knn <- 3
+
+nearest_3 <- lapply(
+  seq_len(nrow(DD)),
+  function(i) {
+
+    FastKNN::k.nearest.neighbors(
+      i,
+      DD,
+      k = k_knn
+    )
+  }
+)
+
+W_knn3 <- matrix(
+  0,
+  nrow = n,
+  ncol = n
+)
+
+for (i in seq_along(nearest_3)) {
+
+  for (j in nearest_3[[i]]) {
+
+    W_knn3[i, j] <- 1
+  }
+}
+
+diag(W_knn3) <- 0
+
+# ============================================================
+# MATRIKS 4
+# INVERSE DISTANCE
+# ============================================================
+
+alpha_inverse <- 1
+
+W_inverse <- 1 / (
+  DD ^ alpha_inverse
+)
+
+diag(W_inverse) <- 0
+
+sum(
+  !is.finite(W_inverse)
+)
+
+W_inverse[
+  !is.finite(W_inverse)
+] <- 0
+
+# ============================================================
+# MATRIKS 5
+# DOUBLE POWER DISTANCE
+# k = 2
+# ============================================================
+
+k_power <- 2
+
+W_double_power <- matrix(
+  0,
+  nrow = n,
+  ncol = n
+)
+
+for (i in seq_len(n)) {
+
+  W_double_power[i, ] <- ifelse(
+
+    DD[i, ] < th,
+
+    (1 - DD[i, ] / th) ^ k_power,
+
+    0
+  )
+}
+
+diag(W_double_power) <- 0
+
+# ============================================================
+# PEMERIKSAAN MATRIKS PEMBOBOT
+# ============================================================
+
+cat(
+  "\nJumlah bobot non-zero:\n"
+)
+
+cat(
+  "Jarak ambang        =",
+  sum(W_threshold != 0),
+  "\n"
+)
+
+cat(
+  "Jarak eksponensial  =",
+  sum(W_exponential != 0),
+  "\n"
+)
+
+cat(
+  "3-NN                =",
+  sum(W_knn3 != 0),
+  "\n"
+)
+
+cat(
+  "Jarak invers        =",
+  sum(W_inverse != 0),
+  "\n"
+)
+
+cat(
+  "Double power        =",
+  sum(W_double_power != 0),
+  "\n"
+)
+
+# ------------------------------------------------------------
+# Pemeriksaan wilayah tanpa tetangga
+# ------------------------------------------------------------
+
+cat(
+  "\nJumlah wilayah tanpa tetangga:\n"
+)
+
+cat(
+  "Jarak ambang =",
+  sum(rowSums(W_threshold) == 0),
+  "\n"
+)
+
+cat(
+  "3-NN         =",
+  sum(rowSums(W_knn3) == 0),
+  "\n"
+)
+
+cat(
+  "Double power =",
+  sum(rowSums(W_double_power) == 0),
+  "\n"
+)
+
+# ============================================================
+# MENYIMPAN LIMA MATRIKS DALAM SATU LIST
+# ============================================================
+
+weights <- list(
+
+  "Jarak ambang" =
+    W_threshold,
+
+  "Jarak eksponensial" =
+    W_exponential,
+
+  "3-tetangga terdekat" =
+    W_knn3,
+
+  "Jarak invers" =
+    W_inverse,
+
+  "Double power distance" =
+    W_double_power
+)
+
+names(weights)
+
+# ============================================================
+# MEMBENTUK LISTW
+# Digunakan untuk Moran's I
+# ============================================================
+
+listw_threshold <- mat2listw(
+  W_threshold,
+  style = "W",
+  zero.policy = TRUE
+)
+
+listw_exponential <- mat2listw(
+  W_exponential,
+  style = "W",
+  zero.policy = TRUE
+)
+
+listw_knn3 <- mat2listw(
+  W_knn3,
+  style = "W",
+  zero.policy = TRUE
+)
+
+listw_inverse <- mat2listw(
+  W_inverse,
+  style = "W",
+  zero.policy = TRUE
+)
+
+listw_double_power <- mat2listw(
+  W_double_power,
+  style = "W",
+  zero.policy = TRUE
+)
+
+# ============================================================
+# RINGKASAN MATRIKS PEMBOBOT
+# ============================================================
+
+ringkasan_bobot <- data.frame(
+
+  Matriks_Pembobot = c(
+    "Jarak ambang",
+    "Jarak eksponensial",
+    "3-tetangga terdekat",
+    "Jarak invers",
+    "Double power distance"
+  ),
+
+  Parameter = c(
+    "d = 2.7",
+    "alpha = 1",
+    "k = 3",
+    "alpha = 1",
+    "k = 2; d = 2.7"
+  ),
+
+  Bobot_Nonzero = c(
+    sum(W_threshold != 0),
+    sum(W_exponential != 0),
+    sum(W_knn3 != 0),
+    sum(W_inverse != 0),
+    sum(W_double_power != 0)
+  )
+)
+
+ringkasan_bobot
+```
+
+```{r}
+# ============================================================
+# PERBANDINGAN MATRIKS PEMBOBOT
+# BERDASARKAN MODEL RE-ESF
+# ============================================================
+
+library(spmoran)
+library(dplyr)
+
+# ------------------------------------------------------------
+# Menyiapkan peubah respons
+# ------------------------------------------------------------
+
+y_resf <- data_ikp_scaled$FSI
+
+# ------------------------------------------------------------
+# Menyiapkan peubah penjelas
+# HDI tidak digunakan karena multikolinearitas
+# ------------------------------------------------------------
+
+x_resf <- data_ikp_scaled %>%
+  select(
+    LE,
+    ASP,
+    GRDP,
+    PGR,
+    FCP,
+    PP,
+    CE
+  )
+
+
+# ============================================================
+# MEMBENTUK MORAN EIGENVECTOR
+# UNTUK MASING-MASING MATRIKS PEMBOBOT
+# ============================================================
+
+meig_threshold <- spmoran::meigen(
+  cmat = W_threshold
+)
+
+meig_exponential <- spmoran::meigen(
+  cmat = W_exponential
+)
+
+meig_knn3 <- spmoran::meigen(
+  cmat = W_knn3
+)
+
+meig_inverse <- spmoran::meigen(
+  cmat = W_inverse
+)
+
+meig_double_power <- spmoran::meigen(
+  cmat = W_double_power
+)
+
+# ------------------------------------------------------------
+# Memeriksa jumlah Moran eigenvector
+# ------------------------------------------------------------
+
+jumlah_eigen <- data.frame(
+
+  Matriks_Pembobot = c(
+    "Jarak ambang",
+    "Jarak eksponensial",
+    "3-tetangga terdekat",
+    "Jarak invers",
+    "Double power distance"
+  ),
+
+  Jumlah_Eigenvector = c(
+    ncol(meig_threshold$sf),
+    ncol(meig_exponential$sf),
+    ncol(meig_knn3$sf),
+    ncol(meig_inverse$sf),
+    ncol(meig_double_power$sf)
+  )
+)
+
+jumlah_eigen
+```
+
+```{r}
+# ============================================================
+# MEMBENTUK MODEL RE-ESF
+# UNTUK SETIAP MATRIKS PEMBOBOT
+# ============================================================
+
+model_threshold <- spmoran::resf(
+  y = y_resf,
+  x = x_resf,
+  meig = meig_threshold,
+  method = "reml"
+)
+
+model_exponential <- spmoran::resf(
+  y = y_resf,
+  x = x_resf,
+  meig = meig_exponential,
+  method = "reml"
+)
+
+model_knn3 <- spmoran::resf(
+  y = y_resf,
+  x = x_resf,
+  meig = meig_knn3,
+  method = "reml"
+)
+
+model_inverse <- spmoran::resf(
+  y = y_resf,
+  x = x_resf,
+  meig = meig_inverse,
+  method = "reml"
+)
+
+model_double_power <- spmoran::resf(
+  y = y_resf,
+  x = x_resf,
+  meig = meig_double_power,
+  method = "reml"
+)
+```
+
+```{r}
+# ============================================================
+# FUNGSI MENGAMBIL METRIK RE-ESF
+# ============================================================
+
+ambil_metrik_resf <- function(model, y) {
+
+  # Prediksi
+  pred <- model$pred
+
+  if (
+    is.matrix(pred) ||
+    is.data.frame(pred)
+  ) {
+
+    if ("pred" %in% colnames(pred)) {
+
+      pred <- pred[, "pred"]
+
+    } else {
+
+      pred <- pred[, 1]
+    }
+  }
+
+  pred <- as.numeric(pred)
+
+
+  # RMSE
+  rmse <- sqrt(
+    mean(
+      (y - pred)^2,
+      na.rm = TRUE
+    )
+  )
+
+
+  # Adjusted R2
+  adj_r2 <- as.numeric(
+    model$e[
+      "adjR2(cond)",
+      1
+    ]
+  )
+
+
+  # AIC
+  aic <- as.numeric(
+    model$e[
+      "AIC",
+      1
+    ]
+  )
+
+
+  data.frame(
+    Adjusted_R2 = adj_r2,
+    RMSE = rmse,
+    AIC = aic
+  )
+}
+```
+
+```{r}
+# ============================================================
+# TABEL PERBANDINGAN MATRIKS PEMBOBOT
+# ============================================================
+
+hasil_threshold <- ambil_metrik_resf(
+  model_threshold,
+  y_resf
+)
+
+hasil_exponential <- ambil_metrik_resf(
+  model_exponential,
+  y_resf
+)
+
+hasil_knn3 <- ambil_metrik_resf(
+  model_knn3,
+  y_resf
+)
+
+hasil_inverse <- ambil_metrik_resf(
+  model_inverse,
+  y_resf
+)
+
+hasil_double_power <- ambil_metrik_resf(
+  model_double_power,
+  y_resf
+)
+
+
+tabel_pembobot <- data.frame(
+
+  Matriks_Pembobot = c(
+    "Jarak ambang",
+    "Jarak eksponensial",
+    "3-tetangga terdekat",
+    "Jarak invers",
+    "Double power distance"
+  ),
+
+  Adjusted_R2 = c(
+    hasil_threshold$Adjusted_R2,
+    hasil_exponential$Adjusted_R2,
+    hasil_knn3$Adjusted_R2,
+    hasil_inverse$Adjusted_R2,
+    hasil_double_power$Adjusted_R2
+  ),
+
+  RMSE = c(
+    hasil_threshold$RMSE,
+    hasil_exponential$RMSE,
+    hasil_knn3$RMSE,
+    hasil_inverse$RMSE,
+    hasil_double_power$RMSE
+  ),
+
+  AIC = c(
+    hasil_threshold$AIC,
+    hasil_exponential$AIC,
+    hasil_knn3$AIC,
+    hasil_inverse$AIC,
+    hasil_double_power$AIC
+  )
+)
+
+
+# Membulatkan hasil
+tabel_pembobot <- tabel_pembobot %>%
+  mutate(
+
+    Adjusted_R2 = round(
+      Adjusted_R2,
+      3
+    ),
+
+    RMSE = round(
+      RMSE,
+      2
+    ),
+
+    AIC = round(
+      AIC,
+      0
+    )
+  )
+
+tabel_pembobot
+```
+
+## Model RE-ESF Final
+
+Model Random Effect Eigenvector Spatial Filtering (RE-ESF) final dibentuk menggunakan matriks pembobot double power distance yang dipilih pada tahap sebelumnya. Moran eigenvector dari matriks tersebut digunakan sebagai basis efek acak spasial, sedangkan LE, ASP, GRDP, PGR, FCP, PP, dan CE digunakan sebagai efek tetap; HDI tidak disertakan karena telah dikeluarkan pada pemeriksaan multikolinearitas. Pendugaan dilakukan menggunakan Restricted Maximum Likelihood (REML).
+
+```{r}
+# ============================================================
+# MODEL RE-ESF FINAL
+# Matriks Pembobot: Double Power Distance (k = 2)
+# ============================================================
+
+library(spmoran)
+library(dplyr)
+
+
+# ------------------------------------------------------------
+# Menetapkan Moran eigenvector final
+# ------------------------------------------------------------
+
+meig_final <- meig_double_power
+
+
+# ------------------------------------------------------------
+# Menetapkan model RE-ESF final
+# ------------------------------------------------------------
+
+# Karena model_double_power sudah dihitung pada tahap
+# perbandingan matriks pembobot, model tidak perlu di-fit ulang.
+
+model_resf_final <- model_double_power
+
+
+# ------------------------------------------------------------
+# Menampilkan hasil model
+# ------------------------------------------------------------
+
+model_resf_final
+
+# ============================================================
+# 10.4 KOEFISIEN REGRESI
+# ============================================================
+
+model_resf_final$b
+
+# Membuat tabel koefisien
+tabel_koef_resf <- as.data.frame(
+  model_resf_final$b
+)
+
+tabel_koef_resf$Peubah <- rownames(
+  tabel_koef_resf
+)
+
+rownames(tabel_koef_resf) <- NULL
+
+# Memindahkan nama peubah ke kolom pertama
+tabel_koef_resf <- tabel_koef_resf %>%
+  select(
+    Peubah,
+    everything()
+  )
+
+# Membulatkan hasil
+tabel_koef_resf <- tabel_koef_resf %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+tabel_koef_resf
+
+# ============================================================
+# PARAMETER EFEK SPASIAL
+# ============================================================
+
+model_resf_final$s
+
+# ============================================================
+# STATISTIK KECOCOKAN MODEL
+# ============================================================
+
+model_resf_final$e
+
+
+# ------------------------------------------------------------
+# Adjusted R-squared
+# ------------------------------------------------------------
+
+adj_r2_resf <- as.numeric(
+  model_resf_final$e[
+    "adjR2(cond)",
+    1
+  ]
+)
+
+
+# ------------------------------------------------------------
+# AIC
+# ------------------------------------------------------------
+
+aic_resf <- as.numeric(
+  model_resf_final$e[
+    "AIC",
+    1
+  ]
+)
+
+
+# ------------------------------------------------------------
+# RMSE
+# ------------------------------------------------------------
+
+resid_resf <- as.numeric(
+  model_resf_final$resid
+)
+
+rmse_resf <- sqrt(
+  mean(
+    resid_resf^2,
+    na.rm = TRUE
+  )
+)
+
+# ============================================================
+# RINGKASAN MODEL FINAL
+# ============================================================
+
+ringkasan_resf_final <- data.frame(
+
+  Model = "RE-ESF",
+
+  Matriks_Pembobot =
+    "Double Power Distance (k = 2)",
+
+  Adjusted_R2 =
+    round(
+      adj_r2_resf,
+      3
+    ),
+
+  RMSE =
+    round(
+      rmse_resf,
+      2
+    ),
+
+  AIC =
+    round(
+      aic_resf,
+      0
+    )
+)
+
+ringkasan_resf_final
+
+
+# ============================================================
+# PREDIKSI MODEL
+# ============================================================
+
+pred_resf <- model_resf_final$pred
+
+if (
+  is.matrix(pred_resf) ||
+  is.data.frame(pred_resf)
+) {
+
+  if ("pred" %in% colnames(pred_resf)) {
+
+    pred_resf <- pred_resf[, "pred"]
+
+  } else {
+
+    pred_resf <- pred_resf[, 1]
+  }
+}
+
+pred_resf <- as.numeric(
+  pred_resf
+)
+
+# ============================================================
+# EFEK SPASIAL
+# ============================================================
+
+spatial_effect <- model_resf_final$sf
+
+if (
+  is.matrix(spatial_effect) ||
+  is.data.frame(spatial_effect)
+) {
+
+  spatial_effect <- spatial_effect[, 1]
+}
+
+spatial_effect <- as.numeric(
+  spatial_effect
+)
+
+# ============================================================
+# MENAMBAHKAN HASIL KE DATA
+# ============================================================
+
+data_ikp_resf <- data_ikp_scaled %>%
+  mutate(
+
+    Prediksi_REESF =
+      pred_resf,
+
+    Residual_REESF =
+      resid_resf,
+
+    Efek_Spasial_REESF =
+      spatial_effect
+  )
+
+# Pemeriksaan
+head(
+  data_ikp_resf %>%
+    select(
+      Wilayah,
+      FSI,
+      Prediksi_REESF,
+      Residual_REESF,
+      Efek_Spasial_REESF
+    )
+)
+```
+
+## Evaluasi Model RE-ESF
+
+```{r}
+# ============================================================
+# EVALUASI MODEL RE-ESF
+# ============================================================
+
+library(dplyr)
+library(spdep)
+library(lmtest)
+library(knitr)
+
+# ------------------------------------------------------------
+# RESIDUAL REGRESI LINEAR DAN RE-ESF
+# ------------------------------------------------------------
+
+resid_lm <- as.numeric(
+  residuals(model_lm)
+)
+
+resid_resf <- as.numeric(
+  model_resf_final$resid
+)
+
+# ------------------------------------------------------------
+# RMSE
+# ------------------------------------------------------------
+
+# Regresi Linear
+rmse_lm <- sqrt(
+  mean(
+    resid_lm^2,
+    na.rm = TRUE
+  )
+)
+
+# RE-ESF
+rmse_resf <- sqrt(
+  mean(
+    resid_resf^2,
+    na.rm = TRUE
+  )
+)
+
+# ------------------------------------------------------------
+# ADJUSTED R-SQUARED
+# ------------------------------------------------------------
+
+# Regresi Linear
+adj_r2_lm <- summary(
+  model_lm
+)$adj.r.squared
+
+
+# RE-ESF
+adj_r2_resf <- as.numeric(
+  model_resf_final$e[
+    "adjR2(cond)",
+    1
+  ]
+)
+
+# ------------------------------------------------------------
+# AIC
+# ------------------------------------------------------------
+
+# Regresi Linear
+aic_lm <- AIC(
+  model_lm
+)
+
+# RE-ESF
+aic_resf <- as.numeric(
+  model_resf_final$e[
+    "AIC",
+    1
+  ]
+)
+
+# ============================================================
+# MORAN'S I RESIDUAL
+# Menggunakan pembobot Double Power Distance,
+# yaitu pembobot model RE-ESF final
+# ============================================================
+
+listw_double_power <- spdep::mat2listw(
+  W_double_power,
+  style = "W",
+  zero.policy = TRUE
+)
+
+# Moran's I residual Regresi Linear
+moran_lm <- spdep::moran.test(
+  resid_lm,
+  listw_double_power,
+  randomisation = TRUE,
+  zero.policy = TRUE
+)
+
+# Moran's I residual RE-ESF
+moran_resf <- spdep::moran.test(
+  resid_resf,
+  listw_double_power,
+  randomisation = TRUE,
+  zero.policy = TRUE
+)
+
+# Mengambil nilai Moran's I
+moran_I_lm <- as.numeric(
+  moran_lm$estimate[["Moran I statistic"]]
+)
+
+moran_I_resf <- as.numeric(
+  moran_resf$estimate[["Moran I statistic"]]
+)
+
+# ------------------------------------------------------------
+# p-value Moran
+# ------------------------------------------------------------
+
+moran_p_lm <- moran_lm$p.value
+moran_p_resf <- moran_resf$p.value
+
+
+# ============================================================
+# 12.6 BREUSCH-PAGAN TEST
+# ============================================================
+
+# ------------------------------------------------------------
+# Regresi Linear
+# ------------------------------------------------------------
+
+bp_lm <- lmtest::bptest(
+  model_lm
+)
+
+bp_stat_lm <- as.numeric(
+  bp_lm$statistic
+)
+
+bp_p_lm <- bp_lm$p.value
+
+# ------------------------------------------------------------
+# RE-ESF
+# ------------------------------------------------------------
+
+data_bp_resf <- data.frame(
+  Residual_REESF = resid_resf,
+  LE   = data_ikp_scaled$LE,
+  ASP  = data_ikp_scaled$ASP,
+  GRDP = data_ikp_scaled$GRDP,
+  PGR  = data_ikp_scaled$PGR,
+  FCP  = data_ikp_scaled$FCP,
+  PP   = data_ikp_scaled$PP,
+  CE   = data_ikp_scaled$CE
+)
+
+model_bp_resf <- lm(
+  Residual_REESF ~
+    LE + ASP + GRDP + PGR + FCP + PP + CE,
+  data = data_bp_resf
+)
+
+
+bp_resf <- lmtest::bptest(
+  model_bp_resf
+)
+
+bp_stat_resf <- as.numeric(
+  bp_resf$statistic
+)
+
+bp_p_resf <- bp_resf$p.value
+
+# ============================================================
+# MEMBUAT TABEL
+# ============================================================
+
+tabel_5_6 <- data.frame(
+
+  Model = c(
+    "Regresi Linear",
+    "RE-ESF"
+  ),
+
+  RMSE = c(
+    rmse_lm,
+    rmse_resf
+  ),
+
+  Adjusted_R2 = c(
+    adj_r2_lm,
+    adj_r2_resf
+  ),
+
+  AIC = c(
+    aic_lm,
+    aic_resf
+  ),
+
+  Moran_I_Residual = c(
+    moran_I_lm,
+    moran_I_resf
+  ),
+
+  BP_test_Residual = c(
+    bp_stat_lm,
+    bp_stat_resf
+  )
+)
+
+
+# ------------------------------------------------------------
+# 12.8 MEMBULATKAN HASIL
+# ------------------------------------------------------------
+
+tabel_5_6 <- tabel_5_6 %>%
+  mutate(
+
+    RMSE = round(
+      RMSE,
+      2
+    ),
+
+    Adjusted_R2 = round(
+      Adjusted_R2,
+      3
+    ),
+
+    AIC = round(
+      AIC,
+      0
+    ),
+
+    Moran_I_Residual = round(
+      Moran_I_Residual,
+      3
+    ),
+
+    BP_test_Residual = round(
+      BP_test_Residual,
+      3
+    )
+  )
+
+
+# ------------------------------------------------------------
+# 12.9 MENAMPILKAN TABEL
+# ------------------------------------------------------------
+
+tabel_5_6
+```
+
+**Catatan:** Hasil numerik yang diperoleh pada lingkungan komputasi saat ini dapat berbeda dari nilai yang dilaporkan dalam artikel yang telah dipublikasikan. Perbedaan tersebut dapat berkaitan dengan versi data masukan, tahapan pengolahan data spasial, maupun versi perangkat lunak dan package yang digunakan. Meskipun demikian, hasil utama perbandingan model menunjukkan pola yang konsisten dengan artikel, yaitu model RE-ESF memberikan kecocokan model yang lebih baik dibandingkan regresi linear. Statistik diagnostik residual, khususnya Moran’s I dan statistik Breusch–Pagan, disajikan secara terpisah karena nilai numeriknya belum tereproduksi secara identik, sehingga hasil rerun tidak dinyatakan sebagai reproduksi eksak terhadap nilai diagnostik pada artikel.

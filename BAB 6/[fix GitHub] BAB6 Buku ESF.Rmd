@@ -1,0 +1,321 @@
+---
+title: "RE-ESF VC pada Data Curah Hujan Bulanan Provinsi Riau"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Ringkasan
+
+Pemodelan curah hujan bulanan di Provinsi Riau menggunakan *Random Effects Eigenvector Spatial Filtering* dengan koefisien bervariasi spasial (RE-ESF VC).
+
+- 32 stasiun BMKG × 60 bulan (2015–2019) = 1.920 pengamatan
+- Respons: curah hujan bulanan
+- Prediktor: altitude, vegetasi (NDVI), jarak ke ekuator, dummy musim hujan, dan 22 komponen PLSR dari luaran CNRM-ESM2 (CMIP6-DCPP)
+- Pembobot spasial: invers jarak antarstasiun (`kronecker` terhadap 60 periode), baris distandarkan
+- `spmoran::meigen()` + `spmoran::resf()` + `spmoran::resf_vc()`
+
+# Persiapan
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r packages}
+library(readxl)
+library(reshape2)
+library(dplyr)
+library(pls)
+library(spdep)
+library(spmoran)
+library(lmtest)
+library(sf)
+library(sp)
+library(fields)
+library(writexl)
+```
+
+# Import dan Penyusunan Data
+
+```{r import-data}
+ch_komplit <- read_excel("data/Data Curah Hujan Komplit.xlsx")
+data_enso  <- read_excel("data/Data El Nino La Nina.xlsx")
+CNRM_ESM2  <- read_excel("data/CNRM-ESM2 Riau (6x6).xlsx")
+CNRM_ESM2  <- CNRM_ESM2[13:372, ]
+iden_lokasi <- read_excel("data/Identifikasi Lokasi.xlsx")
+latitude   <- read_excel("data/Lokasi Data.xlsx", sheet = "LAT")
+longitude  <- read_excel("data/Lokasi Data.xlsx", sheet = "LON")
+ndvi       <- read_excel("data/091024 NDVI RIAU Baru (res 500).xlsx", sheet = "NDVI Akhir Bulan")
+
+datakajian1_master <- cbind(CNRM_ESM2[, 2:37], CNRM_ESM2[, 1], ch_komplit, data_enso[, 3])
+```
+
+```{r susun-data}
+# Periode 2015-2019 (+ 2020 untuk data uji): baris 289 s.d. 360
+st <- 289
+fn <- 360
+datakajian1_master <- datakajian1_master[st:fn, ]
+latitude  <- latitude[st:fn, ]
+longitude <- longitude[st:fn, ]
+
+latitude  <- melt(latitude,  id = "Waktu")
+longitude <- melt(longitude, id = "Waktu")
+
+datakajian1 <- melt(datakajian1_master,
+                    id = c(colnames(datakajian1_master[, c(1:36, 37:39, 72)])))
+colnames(datakajian1)[c(41, 42)] <- c("Stasiun", "ch")
+
+datakajian1 <- cbind(datakajian1, latitude[, 3], longitude[, 3])
+colnames(datakajian1)[c(43, 44)] <- c("lat", "lon")
+datakajian1 <- datakajian1 %>% dplyr::arrange(Waktu)
+```
+
+```{r dummy-musim}
+# Dummy musim hujan: Februari-April dan September-November
+ch_komplit <- ch_komplit[st:fn, ]
+dfch <- melt(ch_komplit, id = c("Thn", "Bln"))
+
+dfch <- dfch %>%
+  mutate(dummy = case_when(
+    dfch[, 2] %in% c(2, 3, 4, 9, 10, 11) ~ 1,
+    TRUE ~ 0
+  ))
+
+dummych <- data.frame(Waktu = CNRM_ESM2[st:fn, 1], dfch)
+dummych <- dummych %>% dplyr::arrange(Waktu)
+```
+
+```{r peubah-lokasi}
+rep <- nrow(datakajian1) / 32
+
+altitude <- do.call("rbind", replicate(rep, iden_lokasi[, 13], simplify = FALSE))
+ekuator  <- do.call("rbind", replicate(rep, iden_lokasi[, 15], simplify = FALSE))
+ekuator2 <- 111.32 * abs(datakajian1[, 43])
+
+ndvi     <- ndvi[, c(1:72, 73)]
+ndvi     <- melt(ndvi, id = "Nama")
+vegetasi <- ndvi[, 3]
+
+dummy <- dummych[, 6]
+
+datakajian0 <- cbind(datakajian1, altitude, vegetasi, ekuator, ekuator2, dummy)
+```
+
+```{r data-latih-uji}
+# Data latih (2015-2019) dan data uji
+datakajian1 <- datakajian0[1:1920, ]
+dftest      <- datakajian0[1921:2304, ]
+
+longlat <- datakajian1[1:32, 43:44]
+D <- as.matrix(dist(longlat, method = "euclidean"))
+
+koor  <- datakajian1[1:1920, 43:44]
+Y     <- datakajian1[1:1920, 42]
+X     <- data.frame(datakajian1[1:1920, c(1:36, 45, 46, 48, 49)])
+Xgrid <- X[, 1:36]
+```
+
+# Reduksi Dimensi Luaran Model Iklim (PLSR)
+
+```{r plsr}
+set.seed(123)
+dfpcr <- data.frame(Y, Xgrid)
+fit <- plsr(Y ~ ., data = dfpcr, scale = TRUE, validation = "CV")
+
+which.min(MSEP(fit)$val[1, 1, ]) - 1
+validationplot(fit, val.type = "MSEP")
+```
+
+```{r komponen-plsr}
+Xpre <- fit$scores
+Xgridbaru <- Xpre[, 1:22]
+Xbaru  <- data.frame(X[, 37:40], Xgridbaru)
+Xbaru2 <- Xbaru
+```
+
+# Matriks Pembobot Spasial
+
+```{r matriks-pembobot}
+# Pembobot invers jarak
+CS <- 1 / D
+CS[!is.finite(CS)] <- 0
+
+matrep <- matrix(rep(1, 60), 60, 60)
+CS <- kronecker(matrep, CS)
+CS <- CS / rowSums(CS, na.rm = TRUE)
+
+dim(CS)
+```
+
+```{r meigen}
+meig <- meigen(cmat = CS)
+summary(meig$ev)
+sum(meig$ev)
+sum(meig$ev > 0, na.rm = TRUE)
+```
+
+# Autokorelasi Spasial
+
+```{r moran-awal}
+wt <- 1
+wa <- 1536
+SWS <- mat2listw(CS[wt:wa, wt:wa])
+
+# Moran's I pada Y
+moran.test(Y[wt:wa], SWS, alternative = "two.sided")
+
+# Moran's I pada galat OLS
+datlm  <- data.frame(Y, Xbaru2)
+fitols <- lm(Y ~ ., data = datlm)
+residual1 <- fitols$residuals[wt:wa]
+moran.test(residual1, SWS, alternative = "two.sided")
+```
+
+# Model RE-ESF
+
+```{r resf}
+meig <- meigen(cmat = CS)
+fitesf <- resf(y = Y, x = Xbaru2, meig = meig)
+fitesf$e
+fitesf
+```
+
+```{r diagnostik-resf}
+residual4 <- fitesf$resid
+
+# Breusch-Pagan
+xreg <- as.matrix(Xbaru2)
+e2 <- residual4^2
+fitaux <- lm(e2 ~ xreg)
+bp.statistic <- length(e2) * summary(fitaux)$r.squared
+bp.pvalue <- pchisq(bp.statistic, ncol(xreg), lower.tail = FALSE)
+c(statistik = bp.statistic, p_value = bp.pvalue)
+
+# Moran's I residual
+SWS <- mat2listw(CS)
+moran.test(residual4, SWS, alternative = "two.sided")
+```
+
+# Model RE-ESF VC
+
+```{r resf-vc, results="hide"}
+fit1 <- resf_vc(y = Y, x = Xbaru2, meig = meig,
+                x_sel = FALSE, x_nvc = FALSE, xconst_nvc = FALSE)
+```
+
+```{r ringkasan-resf-vc}
+fit1$e
+fit1
+```
+
+```{r rmse-resf-vc}
+residual5 <- fit1$resid
+nt <- length(residual5)
+RMSE <- sqrt(sum(residual5^2) / nt)
+cat("Nilai RMSE :", RMSE)
+```
+
+```{r diagnostik-resf-vc}
+# Breusch-Pagan
+xreg <- as.matrix(Xbaru2)
+e2 <- residual5^2
+fitaux <- lm(e2 ~ xreg)
+bp.statistic <- length(e2) * summary(fitaux)$r.squared
+bp.pvalue <- pchisq(bp.statistic, ncol(xreg), lower.tail = FALSE)
+c(statistik = bp.statistic, p_value = bp.pvalue)
+
+# Moran's I residual
+SWS <- mat2listw(CS)
+moran.test(residual5, SWS, alternative = "two.sided")
+moran.plot(as.vector(residual5), SWS, labels = TRUE, pch = 5)
+```
+
+# Peta Koefisien Bervariasi Spasial
+
+```{r grid-riau}
+polygons <- read_sf("data/Riau.shp")
+grd <- st_make_grid(polygons, n = c(100, 100))
+sf_use_s2(FALSE)
+index <- which(lengths(st_intersects(grd, polygons)) > 0)
+riau.grid <- grd[index]
+
+grid_df <- spbabel::sptable(riau.grid)
+coor.grid_pred <- grid_df[, 2:3]
+
+coor_pred <- matrix(c(koor$lon, koor$lat), byrow = FALSE, ncol = 2)
+
+df_coef <- data.frame(fit1$b_vc$altitude, fit1$b_vc$vegetasi,
+                      fit1$b_vc$ekuator2, fit1$b_vc$dummy, koor)
+colnames(df_coef) <- c("alt", "veg", "ekt", "dum", "lat", "lon")
+```
+
+```{r fungsi-peta}
+skala  <- list("SpatialPolygonsRescale", layout.scale.bar(), scale = 25000,
+               fill = c("transparent", "black"), offset = c(41000, 4100000))
+teks0  <- list("sp.text", c(41000, 4104000), "0")
+teks25 <- list("sp.text", c(66000, 4104000), "25 km")
+panah  <- list("SpatialPolygonsRescale", layout.north.arrow(),
+               offset = c(90000, 4150000), scale = 5000)
+
+# Interpolasi thin-plate spline ke grid Riau lalu dipetakan
+peta_tps <- function(koordinat, nilai, judul, palet = "Roma", balik = TRUE, skala_warna = NULL) {
+  surf <- Tps(koordinat, nilai)
+  pred <- predict.Krig(surf, coor.grid_pred)
+  coords <- SpatialPixels(SpatialPoints(coor.grid_pred))
+  dffix <- SpatialPixelsDataFrame(coords, data.frame(coor.grid_pred, pred))
+
+  args <- list(dffix[, 3],
+               col.regions = hcl.colors(256, palet, rev = balik),
+               pch = 20, axes = TRUE, main = judul,
+               sp.layout = list(skala, teks0, teks25, panah),
+               scales = list(draw = TRUE))
+  if (!is.null(skala_warna)) args$colorkey <- list(at = skala_warna)
+  do.call(spplot, args)
+}
+```
+
+```{r peta-koefisien, fig.width=6, fig.height=5}
+peta_tps(coor_pred, df_coef$alt, "Altitude Coefficient")
+peta_tps(coor_pred, df_coef$veg, "Vegetation Coefficient")
+peta_tps(coor_pred, df_coef$ekt, "Equator Coefficient")
+peta_tps(coor_pred, df_coef$dum, "Dummy Coefficient")
+```
+
+# Curah Hujan Aktual dan Dugaan 2019
+
+```{r data-aktual-dugaan}
+dir.create("output", showWarnings = FALSE)
+
+bulan <- c("jan", "feb", "mar", "apr", "mei", "jun",
+           "jul", "agu", "sep", "okt", "nov", "des")
+
+p_ch <- as.data.frame(matrix(fit1$pred[1537:1920, 1], nrow = 32))
+a_ch <- as.data.frame(matrix(Y[1537:1920], nrow = 32))
+colnames(p_ch) <- paste0("p_", bulan, "19")
+colnames(a_ch) <- paste0("a_", bulan, "19")
+
+write_xlsx(p_ch, "output/p_ch.xlsx")
+write_xlsx(a_ch, "output/a_ch.xlsx")
+```
+
+```{r peta-september-desember, fig.width=6, fig.height=5}
+coor_pred32 <- coor_pred[1:32, ]
+nama_bulan <- c(sep = "September", okt = "October", nov = "November", des = "December")
+
+for (b in names(nama_bulan)) {
+  print(peta_tps(coor_pred32, a_ch[[paste0("a_", b, "19")]],
+                 paste("Actual Rainfall", nama_bulan[b], "2019"),
+                 palet = "Viridis", skala_warna = seq(0, 400, 50)))
+  print(peta_tps(coor_pred32, p_ch[[paste0("p_", b, "19")]],
+                 paste("Predicted Rainfall", nama_bulan[b], "2019"),
+                 palet = "Viridis", skala_warna = seq(0, 400, 50)))
+}
+```

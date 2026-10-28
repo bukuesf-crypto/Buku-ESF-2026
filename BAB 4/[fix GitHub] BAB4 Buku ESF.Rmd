@@ -1,0 +1,649 @@
+---
+title: "Eigenvector Spatial Filtering (ESF) pada Data PDRB Kabupaten/Kota Indonesia"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+# Ringkasan
+
+Analisis PDRB kabupaten/kota Indonesia tahun 2019 menggunakan OLS, SAR, SEM, dan *Eigenvector Spatial Filtering* (ESF).
+
+- n = 497 kabupaten/kota (termasuk DKI Jakarta)
+- Respons: PDRB · Prediktor: PAD, JTK, IPM
+- Pembobot spasial: 4-nearest neighbours (KNN)
+- `spmoran::meigen()` + `spmoran::esf()` (forward stepwise, `fn = "r2"`)
+
+# Persiapan
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r packages}
+library(knitr)
+library(openxlsx)
+library(sf)
+library(spdep)
+library(spatialreg)
+library(spmoran)
+library(car)
+library(lmtest)
+library(prettymapr)
+```
+
+# Deskripsi Peubah
+
+```{r tabel-peubah}
+tabel_peubah <- data.frame(
+  Kode = c("Y", "X1", "X2", "X3"),
+  Variabel = c(
+    "PDRB atas dasar harga konstan tahun 2019",
+    "Pendapatan Asli Daerah (PAD)",
+    "Jumlah Tenaga Kerja (JTK)",
+    "Indeks Pembangunan Manusia (IPM)"
+  ),
+  Satuan = c(
+    "Miliar Rupiah",
+    "Juta Rupiah",
+    "Ribu Jiwa",
+    "Persen"
+  )
+)
+
+kable(tabel_peubah)
+```
+
+# Import Data
+
+```{r import-data}
+dataindo <- read.xlsx("data/Data BAB 4.xlsx")
+
+vars_num <- c("PDRB", "PAD", "JTK", "IPM")
+dataindo[vars_num] <- lapply(dataindo[vars_num], as.numeric)
+
+colSums(is.na(dataindo[vars_num]))
+```
+
+```{r validasi-data}
+stopifnot(
+  all(sapply(dataindo[vars_num], is.numeric)),
+  all(complete.cases(dataindo[vars_num]))
+)
+
+cat("Jumlah observasi:", nrow(dataindo), "\n")
+```
+
+```{r cek-n}
+if (nrow(dataindo) != 497) {
+  warning(
+    paste(
+      "Jumlah observasi pada file Excel adalah", nrow(dataindo),
+      "bukan 497. Periksa isi data sebelum melanjutkan."
+    )
+  )
+}
+```
+
+# Penggabungan Data Spasial
+
+## Import Shapefile
+
+```{r import-shapefile}
+peta1 <- st_read(
+  "data/gadm41_IDN_shp/gadm41_IDN_2.shp",
+  quiet = TRUE
+)
+
+cat("Jumlah wilayah shapefile awal:", nrow(peta1), "\n")
+st_crs(peta1)
+```
+
+## Penyesuaian Jumlah Wilayah
+
+Shapefile GADM level-2 memiliki 502 fitur, data Excel memiliki 497 observasi. Lima fitur shapefile non-kabupaten/kota pada baris 60, 107, 140, 428, dan 473 dikeluarkan agar jumlahnya sama.
+
+```{r penyesuaian-jumlah-wilayah}
+peta1 <- peta1[-60, ]
+peta1 <- peta1[-107, ]
+peta1 <- peta1[-140, ]
+peta1 <- peta1[-428, ]
+peta1 <- peta1[-473, ]
+
+stopifnot(nrow(dataindo) == nrow(peta1))
+cat("n =", nrow(peta1), "\n")
+```
+
+```{r cek-jakarta}
+dataindo[
+  grepl("Jakarta", dataindo$prov, ignore.case = TRUE) |
+  grepl("Jakarta", dataindo$name, ignore.case = TRUE),
+  c("prov", "name", "PDRB", "PAD", "JTK", "IPM")
+]
+
+peta1[
+  grepl("Jakarta", peta1$NAME_1, ignore.case = TRUE) |
+  grepl("Jakarta", peta1$NAME_2, ignore.case = TRUE),
+  c("NAME_1", "NAME_2")
+]
+```
+
+```{r tambah-variabel-peta}
+peta1$PDRB <- dataindo$PDRB
+peta1$PAD  <- dataindo$PAD
+peta1$JTK  <- dataindo$JTK
+peta1$IPM  <- dataindo$IPM
+```
+
+# Menyusun Data Analisis
+
+```{r data-frame}
+# cbind() dihindari karena dapat mengubah seluruh kolom numerik menjadi character
+data <- data.frame(
+  PDRB = dataindo$PDRB,
+  PAD  = dataindo$PAD,
+  JTK  = dataindo$JTK,
+  IPM  = dataindo$IPM
+)
+
+stopifnot(
+  nrow(data) == nrow(peta1),
+  all(sapply(data, is.numeric)),
+  all(complete.cases(data))
+)
+```
+
+## Koordinat Centroid
+
+```{r centroid}
+peta_ll <- st_transform(peta1, 4326)
+peta_metric <- st_transform(peta_ll, 6933)
+
+centroid_metric <- st_centroid(peta_metric, of_largest_polygon = TRUE)
+centroid_ll <- st_transform(centroid_metric, 4326)
+
+coords <- st_coordinates(centroid_ll)
+lon <- coords[, 1]
+lat <- coords[, 2]
+```
+
+```{r data-full}
+datafull <- data.frame(
+  prov = peta1$NAME_1,
+  name = peta1$NAME_2,
+  lon  = lon,
+  lat  = lat,
+  PDRB = dataindo$PDRB,
+  PAD  = dataindo$PAD,
+  JTK  = dataindo$JTK,
+  IPM  = dataindo$IPM
+)
+
+stopifnot(
+  nrow(datafull) == nrow(data),
+  all(datafull$PDRB == data$PDRB),
+  all(datafull$PAD  == data$PAD),
+  all(datafull$JTK  == data$JTK),
+  all(datafull$IPM  == data$IPM)
+)
+```
+
+# Identifikasi Efek Spasial
+
+## Peta Sebaran PDRB
+
+```{r peta-sebaran, fig.width=10, fig.height=7}
+k <- 8
+colfunc <- colorRampPalette(c("#F7FBFF", "#6BAED6", "#08306B"))
+
+plot(
+  peta_ll["PDRB"],
+  breaks = "quantile",
+  nbreaks = k,
+  pal     = colfunc,
+  main    = "Sebaran PDRB Kabupaten/Kota di Indonesia Tahun 2019"
+)
+
+addnortharrow(pos = "topright", scale = 0.7)
+```
+
+## Rata-Rata PDRB per Provinsi
+
+```{r rata-pdrb-provinsi}
+pdrbprov <- aggregate(PDRB ~ prov, data = datafull, FUN = mean)
+names(pdrbprov) <- c("Provinsi", "PDRB")
+pdrbprov <- pdrbprov[order(pdrbprov$PDRB, decreasing = TRUE), ]
+```
+
+```{r grafik-pdrb-provinsi, fig.width=12, fig.height=7}
+k <- nrow(pdrbprov)
+warna_biru <- hcl.colors(k, palette = "Blues 3")
+
+oldpar <- par(mar = c(8, 6, 2, 2))
+
+grafik <- barplot(
+  pdrbprov$PDRB,
+  col    = warna_biru,
+  border = NA,
+  xaxt   = "n",
+  yaxt   = "n",
+  xlab   = "",
+  ylab   = ""
+)
+
+text(
+  x = grafik, y = par("usr")[3] - 0.03 * diff(par("usr")[3:4]),
+  labels = pdrbprov$Provinsi, srt = 45, adj = 1, xpd = TRUE, cex = 0.7
+)
+
+axis(side = 2, las = 1)
+mtext("Provinsi", side = 1, line = 6.5)
+mtext("Rata-Rata PDRB (Miliar Rupiah)", side = 2, line = 4.5)
+
+par(oldpar)
+```
+
+# Model OLS
+
+```{r model-ols}
+model_ols <- lm(PDRB ~ PAD + JTK + IPM, data = data)
+summary(model_ols)
+```
+
+# Multikolinearitas
+
+```{r uji-vif}
+vif_hasil <- vif(model_ols)
+vif_hasil
+```
+
+```{r tabel-vif}
+tabel_vif <- data.frame(
+  Variabel = names(vif_hasil),
+  VIF = round(as.numeric(vif_hasil), 4)
+)
+kable(tabel_vif)
+```
+
+# Matriks Pembobot Spasial
+
+```{r bobot-knn}
+coords_mat <- as.matrix(datafull[, c("lon", "lat")])
+
+col.knn <- knearneigh(coords_mat, k = 4, longlat = TRUE)
+bobotknn1 <- knn2nb(col.knn)
+bobotknn <- nb2listw(bobotknn1, style = "W", zero.policy = TRUE)
+cmat <- nb2mat(bobotknn1, style = "B", zero.policy = TRUE)
+```
+
+```{r cek-bobot}
+cat("Jumlah wilayah:", length(bobotknn1), "\n")
+cat("Dimensi C      :", paste(dim(cmat), collapse = " x "), "\n")
+summary(bobotknn1)
+```
+
+```{r plot-knn, fig.width=10, fig.height=7}
+plot(st_geometry(peta_ll), border = "grey", main = "K-nearest Neighbours (k = 4)")
+plot(bobotknn1, coords_mat, add = TRUE)
+```
+
+# Uji Autokorelasi Spasial
+
+```{r moran}
+moran1 <- moran.test(data$PDRB, bobotknn, zero.policy = TRUE)
+moran1
+```
+
+```{r moran-normal}
+moran2 <- moran.test(
+  data$PDRB, bobotknn,
+  randomisation = FALSE, alternative = "greater", zero.policy = TRUE
+)
+moran2
+```
+
+```{r moran-plot, fig.width=8, fig.height=7}
+moranplot <- moran.plot(data$PDRB, bobotknn, labels = datafull$name, zero.policy = TRUE)
+```
+
+# Uji Heteroskedastisitas
+
+```{r uji-bp}
+ujiBP <- bptest(model_ols)
+ujiBP
+```
+
+# Uji Dependensi Spasial
+
+```{r uji-rs}
+# spdep versi terbaru memakai istilah Rao's score (RS) untuk uji yang
+# secara historis dikenal sebagai LM test
+uji_rs <- lm.RStests(model_ols, listw = bobotknn, zero.policy = TRUE, test = "all")
+summary(uji_rs)
+```
+
+```{r uji-lm-historis}
+uji_lm <- lm.LMtests(
+  model_ols, listw = bobotknn, zero.policy = TRUE,
+  test = c("LMerr", "LMlag", "RLMerr", "RLMlag", "SARMA")
+)
+summary(uji_lm)
+```
+
+# Model SAR
+
+```{r model-sar}
+sar <- lagsarlm(
+  PDRB ~ PAD + JTK + IPM, data = data,
+  listw = bobotknn, tol.solve = 1e-5, zero.policy = TRUE
+)
+summary(sar, Nagelkerke = TRUE)
+```
+
+```{r koef-sar}
+coef_sar <- summary(sar)$Coef
+coef_sar
+```
+
+```{r pred-sar}
+predsar <- as.numeric(fitted(sar))
+```
+
+# Model SEM
+
+```{r model-sem}
+sem <- errorsarlm(
+  PDRB ~ PAD + JTK + IPM, data = data,
+  listw = bobotknn, zero.policy = TRUE
+)
+summary(sem, Nagelkerke = TRUE)
+```
+
+```{r koef-sem}
+coef_sem <- summary(sem)$Coef
+coef_sem
+```
+
+```{r pred-sem}
+predsem <- as.numeric(fitted(sem))
+```
+
+# Model ESF
+
+```{r eigen-esf}
+meig <- meigen(cmat = cmat, threshold = 0.25)
+eigenvector <- meig$ev
+cat("Jumlah eigenvector kandidat:", length(eigenvector), "\n")
+```
+
+```{r model-esf}
+Y <- data$PDRB
+X <- as.matrix(data[, c("PAD", "JTK", "IPM")])
+
+# forward stepwise berdasarkan adjusted-R2 (default fn = "r2")
+res <- esf(y = Y, x = X, meig = meig, fn = "r2")
+res
+```
+
+```{r jumlah-eigenvector}
+jumlah_eigen_terpilih <- nrow(res$r)
+cat("Jumlah eigenvector terpilih:", jumlah_eigen_terpilih, "\n")
+```
+
+```{r koef-esf}
+coef_esf <- res$b
+coef_esf
+```
+
+```{r statistik-esf}
+res$e
+```
+
+## Random-Effects ESF (RE-ESF)
+
+```{r model-resf}
+resf_model <- resf(y = Y, x = X, meig = meig, method = "reml")
+resf_model
+```
+
+# Evaluasi Kinerja Model
+
+```{r rmse-function}
+RMSE <- function(pred, obs) sqrt(mean((pred - obs)^2, na.rm = TRUE))
+```
+
+```{r pred-esf}
+predres <- as.numeric(res$pred)
+RMSEres <- RMSE(predres, Y)
+```
+
+```{r pred-resf}
+# resf_model$pred dapat berupa matriks/data.frame atau list tergantung versi spmoran
+pred_obj <- resf_model$pred
+
+if (is.matrix(pred_obj) || is.data.frame(pred_obj)) {
+  if ("pred" %in% colnames(pred_obj)) {
+    predresf <- as.numeric(pred_obj[, "pred"])
+  } else {
+    predresf <- as.numeric(pred_obj[, 1])
+  }
+} else if (is.list(pred_obj) && !is.null(pred_obj$pred)) {
+  predresf <- as.numeric(pred_obj$pred)
+} else {
+  stop("Format resf_model$pred tidak dikenali. Jalankan str(resf_model$pred) untuk pemeriksaan.")
+}
+
+RMSEresf <- RMSE(predresf, Y)
+```
+
+```{r rmse-all}
+RMSEsar <- RMSE(predsar, Y)
+RMSEsem <- RMSE(predsem, Y)
+
+RMSEsar
+RMSEsem
+RMSEres
+RMSEresf
+```
+
+# Adjusted-R2 SAR dan SEM
+
+```{r adjusted-r2}
+# Dihitung dari RSS/TSS agar sebanding secara deskriptif dengan OLS/ESF;
+# AIC dan log-likelihood tetap jadi ukuran utama untuk model spasial
+n <- nrow(data)
+p <- 3
+
+rss_sar <- sum((predsar - Y)^2, na.rm = TRUE)
+tss <- sum((Y - mean(Y))^2, na.rm = TRUE)
+rsq_sar <- 1 - rss_sar / tss
+adj_r2_sar <- 1 - ((1 - rsq_sar) * (n - 1) / (n - p - 1))
+
+rss_sem <- sum((predsem - Y)^2, na.rm = TRUE)
+rsq_sem <- 1 - rss_sem / tss
+adj_r2_sem <- 1 - ((1 - rsq_sem) * (n - 1) / (n - p - 1))
+
+adj_r2_sar
+adj_r2_sem
+```
+
+# Ukuran Kebaikan Model
+
+```{r gof-esf}
+aic_esf <- as.numeric(res$e["AIC", 1])
+adj_r2_esf <- as.numeric(res$e["adjR2", 1])
+loglik_esf <- as.numeric(res$e["logLik", 1])
+bic_esf <- as.numeric(res$e["BIC", 1])
+```
+
+```{r gof-sar-sem}
+aic_sar <- AIC(sar)
+aic_sem <- AIC(sem)
+```
+
+```{r tabel-gof}
+tabel_gof <- data.frame(
+  Ukuran = c("AIC", "Adjusted-R2", "RMSE"),
+  SAR = c(aic_sar, adj_r2_sar, RMSEsar),
+  SEM = c(aic_sem, adj_r2_sem, RMSEsem),
+  ESF = c(aic_esf, adj_r2_esf, RMSEres)
+)
+
+kable(tabel_gof, digits = 4)
+```
+
+# Tabel Dugaan Parameter
+
+```{r tabel-koef}
+coef_sar_vec <- coef_sar[, 1]
+coef_sem_vec <- coef_sem[, 1]
+coef_esf_vec <- coef_esf[, 1]
+
+rho_sar <- sar$rho
+lambda_sem <- sem$lambda
+
+tabel_koef <- data.frame(
+  Variabel = c("Intercept", "PAD", "JTK", "IPM", "rho (SAR)", "lambda (SEM)"),
+  SAR = c(coef_sar_vec[c("(Intercept)", "PAD", "JTK", "IPM")], rho_sar, NA),
+  SEM = c(coef_sem_vec[c("(Intercept)", "PAD", "JTK", "IPM")], NA, lambda_sem),
+  ESF = c(coef_esf_vec[c("(Intercept)", "PAD", "JTK", "IPM")], NA, NA)
+)
+
+kable(tabel_koef, digits = 6)
+```
+
+# Diagnostik Residual
+
+```{r moran-resid-ols}
+moran.test(residuals(model_ols), bobotknn, zero.policy = TRUE)
+```
+
+```{r moran-resid-sar}
+moran.test(residuals(sar), bobotknn, zero.policy = TRUE)
+```
+
+```{r moran-resid-sem}
+moran.test(residuals(sem), bobotknn, zero.policy = TRUE)
+```
+
+```{r moran-resid-esf}
+moran.test(res$resid, bobotknn, zero.policy = TRUE)
+```
+
+# Ringkasan Hasil
+
+```{r ringkasan-hasil}
+hasil_ringkas <- data.frame(
+  Model = c("OLS", "SAR", "SEM", "ESF", "RE-ESF"),
+  AIC = c(
+    AIC(model_ols), AIC(sar), AIC(sem), aic_esf,
+    as.numeric(resf_model$e["AIC", 1])
+  ),
+  Adjusted_R2 = c(
+    summary(model_ols)$adj.r.squared, adj_r2_sar, adj_r2_sem, adj_r2_esf,
+    as.numeric(resf_model$e["adjR2(cond)", 1])
+  ),
+  RMSE = c(RMSE(fitted(model_ols), Y), RMSEsar, RMSEsem, RMSEres, RMSEresf)
+)
+
+kable(hasil_ringkas, digits = 4)
+```
+
+# Waktu Komputasi
+
+```{r waktu-komputasi}
+waktu_sar <- system.time({
+  lagsarlm(
+    PDRB ~ PAD + JTK + IPM, data = data,
+    listw = bobotknn, tol.solve = 1e-5, zero.policy = TRUE
+  )
+})["elapsed"]
+
+waktu_sem <- system.time({
+  errorsarlm(
+    PDRB ~ PAD + JTK + IPM, data = data,
+    listw = bobotknn, zero.policy = TRUE
+  )
+})["elapsed"]
+
+waktu_esf <- system.time({
+  esf(y = Y, x = X, meig = meig, fn = "r2")
+})["elapsed"]
+
+waktu <- data.frame(
+  Model = c("SAR", "SEM", "ESF"),
+  Waktu_detik = c(waktu_sar, waktu_sem, waktu_esf)
+)
+
+kable(waktu, digits = 3)
+```
+
+# Peta Vektor Eigen
+
+```{r peta-vektor-ciri, fig.width=12, fig.height=3.5}
+peta_ll$e2  <- meig$sf[, 2]
+peta_ll$e10 <- meig$sf[, 10]
+peta_ll$e50 <- meig$sf[, 50]
+
+plot_vektor_eigen <- function(peta, kolom, judul, k = 8, warna = c("biru", "hijau")) {
+  warna <- match.arg(warna)
+
+  pal_biru  <- colorRampPalette(c("#F7FBFF", "#6BAED6", "#08306B"))
+  pal_hijau <- colorRampPalette(c("#F7FCF5", "#74C476", "#00441B"))
+  colfunc <- if (warna == "biru") pal_biru else pal_hijau
+
+  oldpar <- par(las = 1, mar = c(2, 1, 2, 1))
+
+  plot(
+    peta[kolom],
+    breaks  = "quantile",
+    nbreaks = k,
+    pal     = colfunc,
+    border  = "grey40",
+    lwd     = 0.3,
+    main    = judul
+  )
+
+  addnortharrow(pos = "topright", scale = 0.6)
+
+  par(oldpar)
+}
+
+plot_vektor_eigen(peta_ll, "e2",  "(a) Vektor Eigen e2",  warna = "biru")
+plot_vektor_eigen(peta_ll, "e10", "(b) Vektor Eigen e10", warna = "biru")
+plot_vektor_eigen(peta_ll, "e50", "(c) Vektor Eigen e50", warna = "biru")
+```
+
+# Pemeriksaan Akhir
+
+```{r final-check}
+cat("Jumlah observasi       :", nrow(data), "\n")
+cat("Jumlah wilayah spasial :", nrow(peta1), "\n")
+cat("Dimensi matriks C      :", paste(dim(cmat), collapse = " x "), "\n")
+cat("Jumlah KNN              :", length(bobotknn1), "\n")
+cat("Jumlah eigenvector      :", length(meig$ev), "\n")
+cat("Eigenvector terpilih    :", nrow(res$r), "\n")
+
+sapply(data, class)
+colSums(is.na(data))
+
+peta1[grepl("Jakarta", peta1$NAME_1, ignore.case = TRUE), c("NAME_1", "NAME_2")]
+```
+
+# Referensi
+
+Griffith, D. A. (2002). A spatial filtering specification for the auto-Poisson model. *Statistics & Probability Letters*, 58(3), 245–251.
+
+Griffith, D. A., Chun, Y., & Li, B. (2019). *Spatial Regression Analysis Using Eigenvector Spatial Filtering*. London: Elsevier.
+
+Murakami, D., & Griffith, D. A. (2019). Eigenvector spatial filtering for large data sets: Fixed and random effects approaches. *Geographical Analysis*, 51(1), 23–49.
+
+Sahputri, N. R., Djuraidah, A., & Soleh, A. M. (2022). Spatial regression model on gross regional domestic products in Indonesia with Eigenvector spatial filtering approach. *AIP Conference Proceedings*.
+
+Thayn, J. B., & Simanis, J. M. (2013). Accounting for spatial autocorrelation in linear regression models using spatial filtering with eigenvectors. *Annals of the Association of American Geographers*, 103(1), 47–66.
